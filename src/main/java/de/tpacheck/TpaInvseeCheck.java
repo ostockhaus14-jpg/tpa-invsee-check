@@ -13,6 +13,6 @@ public class TpaInvseeCheck implements ClientModInitializer {
     public void onInitializeClient() {
         CONFIG = TpaConfig.load();
         TpaChecker.init();
-        LOG.info("TPA Invsee Check geladen ({} wertvolle Items)", CONFIG.valuableItems.size());
+        LOG.info("TPA Invsee Check geladen ({} Regeln)", CONFIG.rules.size());
     }
 }
