@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "tpa_invsee_check",
+  "version": "${version}",
+  "name": "TPA Invsee Check",
+  "description": "Prüft bei eingehenden /tpa-Anfragen automatisch per /invsee das Inventar des Spielers auf wertvolle Items.",
+  "authors": ["Oli"],
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "client": ["de.tpacheck.TpaInvseeCheck"],
+    "modmenu": ["de.tpacheck.ModMenuIntegration"]
+  },
+  "depends": {
+    "fabricloader": ">=0.18.0",
+    "minecraft": "~1.21.11",
+    "java": ">=21",
+    "fabric-api": "*"
+  },
+  "suggests": {
+    "modmenu": "*"
+  }
+}
