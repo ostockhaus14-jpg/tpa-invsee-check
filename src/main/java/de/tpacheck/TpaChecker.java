@@ -20,8 +20,8 @@ import net.minecraft.util.Formatting;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
-import java.util.HashSet;
-import java.util.LinkedHashMap;
+import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -30,8 +30,8 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Ablauf: TPA-Nachricht erkannt -> /invsee NAME -> Container-Screen (6 Reihen) scannen
- * -> bei Fund Buttons einblenden, sonst Fenster schließen.
+ * Ablauf: TPA-Nachricht erkannt -> (wenn kein anderes Fenster offen ist) /invsee NAME
+ * -> Container-Screen (6 Reihen) scannen -> bei Fund Buttons einblenden, sonst Fenster schließen.
  */
 public final class TpaChecker {
     /**
@@ -40,19 +40,30 @@ public final class TpaChecker {
      */
     private static final Pattern TPA_ACCEPT = Pattern.compile(
             "/tpaccept\\s+([A-Za-z0-9_.]{1,20})\\s+tpa\\b(?!\\s*here)", Pattern.CASE_INSENSITIVE);
+    /** Alte Farbcodes ("§a") entfernen, falls ein Server sie als normalen Text schickt. */
+    private static final Pattern FORMAT_CODES = Pattern.compile("\u00a7.");
 
-    // Layout des Invsee-Menüs (6 Reihen = 54 Slots), passend zu deinem Screenshot:
+    // Layout des Invsee-Menüs (6 Reihen = 54 Slots), passend zum Screenshot:
     // 0-35 Inventar | 36 Armorstand-Label | 37-40 Rüstung | 41-44 Barrieren
     // 45 Nether-Star-Label | 46 Offhand | 47-53 Barrieren
     private static final int INVENTORY_END = 36;
     private static final int ARMOR_FIRST = 37, ARMOR_LAST = 40;
     private static final int OFFHAND = 46;
 
+    private static final int MAX_QUEUE = 5;               // Schutz gegen Spam
+    private static final long REQUEST_TTL = 2400;         // Ticks (2 min): ältere Anfragen verwerfen
+    private static final long SAME_PLAYER_COOLDOWN = 200; // Ticks (10 s): gleicher Spieler wird nicht ständig neu geprüft
+    private static final int WAIT_FOR_SCREEN_TICKS = 60;  // so lange auf das Invsee-Fenster warten
+
     private enum Phase { IDLE, WAITING, SCANNING, FOUND }
 
-    private static final Deque<String> queue = new ArrayDeque<>();
+    private record Pending(String name, long created) {}
+
+    private static final Deque<Pending> queue = new ArrayDeque<>();
+    private static final Map<String, Long> lastScan = new HashMap<>();
     private static Phase phase = Phase.IDLE;
     private static String current;
+    private static long now;
     private static int ticks;
     private static int cooldown;
     private static int baseSyncId;
@@ -69,10 +80,12 @@ public final class TpaChecker {
         });
         ClientTickEvents.END_CLIENT_TICK.register(TpaChecker::tick);
         ScreenEvents.AFTER_INIT.register((client, screen, w, h) -> {
-            if (screen instanceof GenericContainerScreen gcs) buildButtons(gcs, w, h);
+            // Nur während eines laufenden Checks Buttons anlegen (normale Kisten bleiben unberührt)
+            if (phase != Phase.IDLE && screen instanceof GenericContainerScreen gcs) buildButtons(gcs, w, h);
         });
         ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
             queue.clear();
+            lastScan.clear();
             release();
         });
     }
@@ -84,14 +97,21 @@ public final class TpaChecker {
         if (!cfg.enabled) return;
         MinecraftClient mc = MinecraftClient.getInstance();
         if (!serverAllowed(mc)) return;
-        Matcher m = TPA_ACCEPT.matcher(message.getString());
+
+        String text = FORMAT_CODES.matcher(message.getString().replace('\u00a0', ' ')).replaceAll("");
+        Matcher m = TPA_ACCEPT.matcher(text);
         while (m.find()) {
             String name = m.group(1);
             if (mc.player != null && name.equalsIgnoreCase(mc.player.getName().getString())) continue;
             if (name.equalsIgnoreCase(current)) continue;
             boolean queued = false;
-            for (String q : queue) if (q.equalsIgnoreCase(name)) queued = true;
-            if (!queued) queue.add(name);
+            for (Pending p : queue) {
+                if (p.name().equalsIgnoreCase(name)) { queued = true; break; }
+            }
+            if (queued || queue.size() >= MAX_QUEUE) continue;
+            Long last = lastScan.get(name.toLowerCase(Locale.ROOT));
+            if (last != null && now - last < SAME_PLAYER_COOLDOWN) continue;
+            queue.add(new Pending(name, now));
         }
     }
 
@@ -106,6 +126,7 @@ public final class TpaChecker {
     // ---------------------------------------------------------------- Tick / Zustandsmaschine
 
     private static void tick(MinecraftClient mc) {
+        now++;
         if (mc.player == null || mc.getNetworkHandler() == null) {
             if (phase != Phase.IDLE) release();
             return;
@@ -114,7 +135,14 @@ public final class TpaChecker {
 
         switch (phase) {
             case IDLE -> {
-                if (cooldown == 0 && !queue.isEmpty() && TpaInvseeCheck.CONFIG.enabled) start(mc);
+                if (!TpaInvseeCheck.CONFIG.enabled) {
+                    queue.clear();
+                    return;
+                }
+                while (!queue.isEmpty() && now - queue.peek().created() > REQUEST_TTL) queue.poll();
+                // Nur starten, wenn der Spieler gerade kein Fenster offen hat (Chat, Kiste, Menü ...),
+                // damit nichts unterbrochen oder weggeschlossen wird.
+                if (cooldown == 0 && !queue.isEmpty() && mc.currentScreen == null) start(mc);
             }
             case WAITING -> {
                 ticks++;
@@ -125,7 +153,7 @@ public final class TpaChecker {
                     activeScreen = s;
                     phase = Phase.SCANNING;
                     ticks = 0;
-                } else if (ticks > 60) {
+                } else if (ticks > WAIT_FOR_SCREEN_TICKS) {
                     chat(mc, Formatting.RED, "Kein /invsee-Fenster für " + current
                             + " erhalten (keine Rechte, Spieler offline oder anderes Menü?).");
                     release();
@@ -141,6 +169,9 @@ public final class TpaChecker {
                 List<String> found = scan((GenericContainerScreen) activeScreen);
                 if (!found.isEmpty()) {
                     phase = Phase.FOUND;
+                    if (uiScreen != activeScreen) { // Sicherheitsnetz: Buttons fehlen noch
+                        buildButtons((GenericContainerScreen) activeScreen, activeScreen.width, activeScreen.height);
+                    }
                     setButtonsVisible(true);
                     chat(mc, Formatting.GOLD, "PLAYER GEFUNDEN: " + current + " hat " + String.join(", ", found));
                 } else if (ticks >= TpaInvseeCheck.CONFIG.scanDelayTicks) {
@@ -157,8 +188,11 @@ public final class TpaChecker {
     }
 
     private static void start(MinecraftClient mc) {
-        current = queue.poll();
-        if (current == null) return;
+        Pending p = queue.poll();
+        if (p == null) return;
+        current = p.name();
+        lastScan.put(current.toLowerCase(Locale.ROOT), now);
+        lastScan.values().removeIf(t -> now - t > 6000);
         ticks = 0;
         phase = Phase.WAITING;
         baseSyncId = mc.player.currentScreenHandler.syncId;
@@ -166,10 +200,14 @@ public final class TpaChecker {
     }
 
     private static void release() {
-        phase = Phase.IDLE;
-        current = null;
-        activeScreen = null;
         setButtonsVisible(false);
+        labelBtn = null;
+        acceptBtn = null;
+        denyBtn = null;
+        uiScreen = null;
+        activeScreen = null;
+        current = null;
+        phase = Phase.IDLE;
     }
 
     // ---------------------------------------------------------------- Scan
@@ -181,25 +219,32 @@ public final class TpaChecker {
     }
 
     private static List<String> scan(GenericContainerScreen screen) {
-        GenericContainerScreenHandler h = screen.getScreenHandler();
-        Set<String> valuable = new HashSet<>(TpaInvseeCheck.CONFIG.valuableItems);
-        if (valuable.isEmpty()) return List.of();
+        List<ItemRule> rules = TpaInvseeCheck.CONFIG.rules;
+        if (rules.isEmpty()) return List.of();
 
-        Map<String, Integer> counts = new LinkedHashMap<>();
-        Map<String, String> names = new LinkedHashMap<>();
-        int size = h.getRows() * 9; // nur der Container, nie das eigene Inventar darunter
+        GenericContainerScreenHandler h = screen.getScreenHandler();
+        List<ItemStack> stacks = new ArrayList<>();
+        int size = Math.min(h.getRows() * 9, h.slots.size()); // nur der Container, nie das eigene Inventar darunter
         for (int i = 0; i < size; i++) {
             if (!isScannableSlot(i)) continue;
             ItemStack st = h.getSlot(i).getStack();
             if (st.isEmpty() || st.isOf(Items.BARRIER)) continue;
-            String id = Registries.ITEM.getId(st.getItem()).toString();
-            if (!valuable.contains(id)) continue;
-            counts.merge(id, st.getCount(), Integer::sum);
-            names.putIfAbsent(id, st.getName().getString());
+            stacks.add(st);
         }
-        List<String> out = new ArrayList<>();
-        counts.forEach((id, c) -> out.add(c + "x " + names.get(id)));
-        return out;
+
+        Set<String> out = new LinkedHashSet<>();
+        for (ItemRule r : rules) {
+            int sum = 0;
+            ItemStack sample = null;
+            for (ItemStack st : stacks) {
+                if (ItemMatcher.matches(r, st)) {
+                    sum += st.getCount();
+                    if (sample == null) sample = st;
+                }
+            }
+            if (sample != null && sum >= r.minCount) out.add(sum + "x " + ItemMatcher.describe(sample));
+        }
+        return new ArrayList<>(out);
     }
 
     // ---------------------------------------------------------------- Buttons über dem Inventar
